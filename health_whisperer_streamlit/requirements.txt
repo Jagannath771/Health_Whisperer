@@ -1,6 +1,6 @@
 streamlit>=1.36
 supabase==2.5.1
-postgrest==0.15.3
+postgrest
 httpx==0.27.2
 httpcore==1.0.5
 python-telegram-bot==21.4

@@ -81,10 +81,38 @@ def _fmt_ts(ts_iso: str | None) -> str:
     except Exception:
         return ts_iso
 
-# ===== Robust timestamp parsing (fix for your error) =====
+# ===== Robust timestamp parsing =====
 def _to_dt(series: pd.Series) -> pd.Series:
     # Parse ISO8601 variants like "...Z" or "+00:00"; keep tz-aware in UTC
     return pd.to_datetime(series, format="ISO8601", utc=True, errors="coerce")
+
+# ===== Numeric safety helpers =====
+def _to_num(series: pd.Series) -> pd.Series:
+    # Coerce to numeric and keep NaN for later handling
+    return pd.to_numeric(series, errors="coerce")
+
+def _safe_max(series: pd.Series | None, default: int | float = 0):
+    """
+    Returns a safe max:
+      - if series is None or empty -> default
+      - if all values are NaN -> default
+      - else -> max ignoring NaN
+    """
+    if series is None:
+        return default
+    s = _to_num(series)
+    if s.empty:
+        return default
+    m = s.max(skipna=True)
+    return default if pd.isna(m) else m
+
+def _safe_sum(series: pd.Series | None, default: int | float = 0):
+    if series is None:
+        return default
+    s = _to_num(series).fillna(0)
+    if s.empty:
+        return default
+    return s.sum()
 
 # ===== Data loaders =====
 def load_meals(uid: str, days_back: int = 14) -> pd.DataFrame:
@@ -99,8 +127,11 @@ def load_meals(uid: str, days_back: int = 14) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["ts","meal_type","calories","protein_g","carbs_g","fat_g","fiber_g","sugar_g","sodium_mg","items","raw_text"])
     df = pd.DataFrame(rows)
-    # --- THE FIX: robust datetime parse ---
     df["ts"] = _to_dt(df["ts"])
+    # Ensure key nutrient columns are numeric
+    for col in ["calories","protein_g","carbs_g","fat_g","fiber_g","sugar_g","sodium_mg"]:
+        if col in df.columns:
+            df[col] = _to_num(df[col])
     return df
 
 def load_metrics(uid: str, days_back: int = 14) -> pd.DataFrame:
@@ -116,6 +147,9 @@ def load_metrics(uid: str, days_back: int = 14) -> pd.DataFrame:
         return pd.DataFrame(columns=["ts","source","steps","water_ml","sleep_minutes","heart_rate","mood","meal_quality","calories"])
     df = pd.DataFrame(rows)
     df["ts"] = _to_dt(df["ts"])
+    for col in ["steps","water_ml","sleep_minutes","heart_rate","mood","meal_quality","calories"]:
+        if col in df.columns:
+            df[col] = _to_num(df[col])
     return df
 
 def get_prefs(uid: str) -> dict:
@@ -137,34 +171,38 @@ end_today_l = start_today_l + timedelta(days=1)
 start_today_u = start_today_l.astimezone(timezone.utc)
 end_today_u = end_today_l.astimezone(timezone.utc)
 
-today_meals = meals_df[(meals_df["ts"] >= start_today_u) & (meals_df["ts"] < end_today_u)]
-today_metrics = metrics_df[(metrics_df["ts"] >= start_today_u) & (metrics_df["ts"] < end_today_u)]
+today_meals = meals_df[(meals_df["ts"] >= start_today_u) & (meals_df["ts"] < end_today_u)] if not meals_df.empty else pd.DataFrame(columns=meals_df.columns)
+today_metrics = metrics_df[(metrics_df["ts"] >= start_today_u) & (metrics_df["ts"] < end_today_u)] if not metrics_df.empty else pd.DataFrame(columns=metrics_df.columns)
 
 kcal_goal  = int(prefs.get("daily_calorie_goal") or 2000)
 water_goal = int(prefs.get("daily_water_ml") or 2000)
 steps_goal = int(prefs.get("daily_step_goal") or 8000)
 sleep_goal = int(prefs.get("sleep_goal_min") or 420)
 
-today_kcal  = int(today_meals.get("calories", pd.Series([0])).fillna(0).sum())
-today_water = int(today_metrics.get("water_ml", pd.Series([0])).fillna(0).max())
-today_steps = int(today_metrics.get("steps", pd.Series([0])).fillna(0).max())
-today_sleep = int(today_metrics.get("sleep_minutes", pd.Series([0])).fillna(0).max())
-today_mood  = int(today_metrics.get("mood", pd.Series([0])).fillna(0).max())
+# ---- SAFE totals/max (prevents ValueError: cannot convert float NaN to integer)
+today_kcal  = int(_safe_sum(today_meals.get("calories")))
+today_water = int(_safe_max(today_metrics.get("water_ml")))
+today_steps = int(_safe_max(today_metrics.get("steps")))
+today_sleep = int(_safe_max(today_metrics.get("sleep_minutes")))
+# Mood is often small ints; keep as int if available else "—"
+_mood_val = _safe_max(today_metrics.get("mood"))
+today_mood = None if _mood_val in (0, None) else int(_mood_val)
 
 a,b,c,d,e = st.columns(5)
 a.metric("Calories", f"{today_kcal}/{kcal_goal}")
 b.metric("Water",    f"{today_water}/{water_goal} ml")
 c.metric("Steps",    f"{today_steps}/{steps_goal}")
 d.metric("Sleep",    f"{today_sleep}/{sleep_goal} min")
-e.metric("Mood",     today_mood or "—")
+e.metric("Mood",     today_mood if today_mood is not None else "—")
 
 st.divider()
 
 # ===== Calories by day (last 14) =====
 st.subheader("Calories (last 14 days)")
-if not meals_df.empty:
+if not meals_df.empty and "calories" in meals_df.columns:
     meals_df["date"] = meals_df["ts"].dt.tz_convert("UTC").dt.date
-    cal_day = meals_df.groupby("date", as_index=False)["calories"].sum()
+    cal_day = (meals_df.groupby("date", as_index=False)["calories"]
+               .sum(numeric_only=True))
     st.bar_chart(cal_day.set_index("date")["calories"])
 else:
     st.info("No meals logged yet.")
@@ -173,7 +211,7 @@ else:
 c1, c2 = st.columns(2)
 with c1:
     st.subheader("Steps (last 14 days)")
-    if not metrics_df.empty:
+    if not metrics_df.empty and "steps" in metrics_df.columns:
         m = metrics_df.copy()
         m["date"] = m["ts"].dt.tz_convert("UTC").dt.date
         steps_day = m.groupby("date", as_index=False)["steps"].max(numeric_only=True)
@@ -183,7 +221,7 @@ with c1:
 
 with c2:
     st.subheader("Water (ml, last 14 days)")
-    if not metrics_df.empty:
+    if not metrics_df.empty and "water_ml" in metrics_df.columns:
         m = metrics_df.copy()
         m["date"] = m["ts"].dt.tz_convert("UTC").dt.date
         water_day = m.groupby("date", as_index=False)["water_ml"].max(numeric_only=True)
@@ -200,13 +238,15 @@ if today_meals.empty:
 else:
     for _, row in today_meals.sort_values("ts", ascending=False).iterrows():
         ts_local = row["ts"].astimezone(tz).strftime("%b %d, %Y • %I:%M %p")
-        kcal = int(row.get("calories") or 0)
-        p = int(row.get("protein_g") or 0)
-        c = int(row.get("carbs_g") or 0)
-        f = int(row.get("fat_g") or 0)
+        kcal = int((row.get("calories") if row.get("calories") is not None else 0) or 0)
+        p = int((row.get("protein_g") if row.get("protein_g") is not None else 0) or 0)
+        c = int((row.get("carbs_g") if row.get("carbs_g") is not None else 0) or 0)
+        f = int((row.get("fat_g") if row.get("fat_g") is not None else 0) or 0)
         fiber = row.get("fiber_g")
-        fiber_txt = f" • Fiber:{int(fiber)}" if fiber not in (None, 0, "") else ""
+        fiber_val = 0 if fiber is None or pd.isna(fiber) else int(fiber)
+        fiber_txt = f" • Fiber:{fiber_val}" if fiber_val else ""
         st.markdown(f"**{ts_local}** — **{kcal} kcal** (P:{p} C:{c} F:{f}){fiber_txt}")
+
         items = row.get("items") or []
         if isinstance(items, str):
             # try to show parsed items if json was stored as string
@@ -219,6 +259,6 @@ else:
             name = it.get("name") if isinstance(it, dict) else str(it)
             qty  = (it.get("qty_g") if isinstance(it, dict) else None)
             note = (it.get("notes") if isinstance(it, dict) else None)
-            qtxt = f" ({int(qty)} g)" if qty not in (None, "", 0) else ""
+            qtxt = f" ({int(qty)} g)" if qty not in (None, "", 0) and not pd.isna(qty) else ""
             ntxt = f" — {note}" if note else ""
             st.write(f"- {name}{qtxt}{ntxt}")

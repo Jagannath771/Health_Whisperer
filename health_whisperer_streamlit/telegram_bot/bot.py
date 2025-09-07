@@ -32,6 +32,7 @@ log = logging.getLogger("hw-bot")
 
 # =================== Helpers ===================
 def get_profile_for_telegram_id(tg_id: int):
+    # resolve via tg_links -> profiles
     link_res = sb.table("tg_links").select("user_id").eq("telegram_id", tg_id).maybe_single().execute()
     data = getattr(link_res, "data", None)
     if not data:
@@ -95,7 +96,8 @@ def _parse_items_kcal(text: str):
 def upsert_meals(uid: str, day_meals: dict) -> bool:
     """
     Store per-meal rows in hw_meals if table exists.
-    hw_meals schema: (id uuid default gen_random_uuid(), uid uuid, ts timestamptz default now(), meal_type text, items text, calories int)
+    hw_meals schema: (id uuid default gen_random_uuid(), uid uuid, ts timestamptz default now(),
+                      meal_type text, items text, calories int)
     """
     try:
         rows = []
@@ -139,6 +141,7 @@ def save_metrics(uid: str, answers: dict, tg_id_for_fix: Optional[int]):
         sb.table("hw_metrics").insert(payload).execute()
         log.info("Saved metrics for uid=%s (kcal=%s steps=%s sleep=%s)", uid, total_cal, answers.get("steps"), answers.get("sleep_minutes"))
     except APIError as e:
+        # If missing FK to hw_users (first-time users), create and retry
         if getattr(e, "code", "") == "23503" or "not present in table \"hw_users\"" in str(e):
             ensure_hw_user(uid, tg_id_for_fix)
             sb.table("hw_metrics").insert(payload).execute()
@@ -183,6 +186,26 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "3) Use /checkin to log your day quickly, or just say hi!"
     )
 
+async def whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    link = sb.table("tg_links").select("user_id, link_code").eq("telegram_id", tg_id).maybe_single().execute().data or {}
+    await update.message.reply_text(f"telegram_id={tg_id}\nlinked_uid={link.get('user_id')}\nlink_code={link.get('link_code')}")
+
+async def unlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    try:
+        # Clear preferences + tg_links for this telegram_id
+        row = sb.table("tg_links").select("user_id").eq("telegram_id", tg_id).maybe_single().execute().data or {}
+        uid = row.get("user_id")
+        if uid:
+            sb.table("hw_preferences").update({"telegram_chat_id": None}).eq("uid", uid).execute()
+            sb.table("hw_users").update({"tg_chat_id": None}).eq("uid", uid).execute()
+        sb.table("tg_links").delete().eq("telegram_id", tg_id).execute()
+        await update.message.reply_text("This Telegram account is unlinked. Use /link <CODE> to link again.")
+    except Exception as e:
+        log.exception("unlink failed: %s", e)
+        await update.message.reply_text("Unlink failed. Try again later.")
+
 async def link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         return await update.message.reply_text("Usage: /link ABCD1234")
@@ -190,25 +213,38 @@ async def link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
 
     try:
-        res = sb.table("tg_links").select("user_id, telegram_id").eq("link_code", code).maybe_single().execute()
+        # 1) Find the row by link_code
+        res = sb.table("tg_links").select("user_id, link_code, telegram_id").eq("link_code", code).maybe_single().execute()
         row = getattr(res, "data", None)
         if not row:
             return await update.message.reply_text("Invalid or expired code. Generate a fresh one in the website.")
 
         user_id_for_code = row["user_id"]
-        sb.table("tg_links").upsert(
-            {"user_id": user_id_for_code, "telegram_id": tg_id, "link_code": code},
-            on_conflict="telegram_id"
-        ).execute()
 
+        # 2) Attach THIS Telegram account to THAT code row (no upsert to avoid unique collisions)
+        sb.table("tg_links").update({"telegram_id": tg_id}).eq("link_code", code).execute()
+
+        # 3) Remove any other rows that still point to this telegram_id (stale links)
+        try:
+            sb.table("tg_links").delete().neq("link_code", code).eq("telegram_id", tg_id).execute()
+        except Exception:
+            pass
+
+        # 4) Ensure hw_users + mirror into hw_preferences.telegram_chat_id (delivery path used by worker)
         ensure_hw_user(user_id_for_code, tg_id)
+        try:
+            sb.table("hw_preferences").upsert({"uid": user_id_for_code, "telegram_chat_id": tg_id}).execute()
+        except Exception:
+            pass
+
         log.info("Linked telegram_id=%s to uid=%s", tg_id, user_id_for_code)
         return await update.message.reply_text("Linked! You can now receive personalized nudges.")
-    except APIError:
-        sb.table("tg_links").update({"user_id": user_id_for_code, "link_code": code}).eq("telegram_id", tg_id).execute()
-        ensure_hw_user(user_id_for_code, tg_id)
-        log.info("Re-linked telegram_id=%s to uid=%s (fallback)", tg_id, user_id_for_code)
-        return await update.message.reply_text("Re-linked to your profile. You’re all set!")
+    except APIError as e:
+        log.exception("Supabase APIError during /link: %s", e)
+        return await update.message.reply_text("Link failed due to a database constraint. Generate a new code and try again.")
+    except Exception as e:
+        log.exception("Unexpected /link failure: %s", e)
+        return await update.message.reply_text("Link failed. Please try again in a minute.")
 
 async def checkin_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
@@ -360,6 +396,8 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("whoami", whoami))
+    app.add_handler(CommandHandler("unlink", unlink))
     app.add_handler(CommandHandler("link", link))
     app.add_handler(checkin)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
