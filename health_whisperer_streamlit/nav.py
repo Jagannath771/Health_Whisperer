@@ -1,56 +1,68 @@
 # nav.py
 import streamlit as st
 
-# Map label -> Streamlit page path
-PAGES = {
-    "Home": "app.py",
-    "Sign Up": "pages/01_Sign_Up.py",
-    "Sign In": "pages/02_Sign_In.py",
-    "My Profile": "pages/03_My_Profile.py",
-    "Get Started": "pages/04_Get_Started.py",
-    "Dashboard": "pages/05_Dashboard.py",
-    "Log Metrics": "pages/06_Log_Metrics.py",   # make sure this file exists
-    "Preferences": "pages/07_Preferences.py",   # make sure this file exists
-}
+def _render_links(current_key: str):
+    # Order: Home → Sign Up/Sign In → Profile → Dashboard → Log Metrics → Preferences → Get Started
+    st.page_link("app.py", label="🏠 Home")
+    st.page_link("pages/01_Sign_Up.py", label="📝 Sign Up")
+    st.page_link("pages/02_Sign_In.py", label="🔐 Sign In")
+    st.page_link("pages/03_My_Profile.py", label="🧩 My Profile")
+    st.page_link("pages/05_Dashboard.py", label="📊 Dashboard")
+    st.page_link("pages/06_Log_Metrics.py", label="📝 Log Metrics")         # ← added
+    st.page_link("pages/07_Preferences.py", label="⚙️ Preferences")         # ← added
+    st.page_link("pages/04_Get_Started.py", label="🚀 Get Started")
 
-def top_nav(current: str = "", right_slot=None):
+def _default_signout():
+    pass
+
+def top_nav(*args, **kwargs):
     """
-    Render a sticky top bar with buttons that call st.switch_page().
-    - current: label from PAGES to highlight (e.g., "Dashboard")
-    - right_slot: optional callable that renders content on the right (e.g., Sign out button)
+    Back-compat shim supporting both of your call styles:
+
+    A) top_nav(is_authed: bool, on_sign_out: callable, current: str = "")
+    B) top_nav(current: str = "", right_slot: callable = None)
     """
-    st.markdown("""
-    <style>
-      .hw-topbar { position: sticky; top: 0; z-index: 100; background:#0f1117;
-                   padding:10px 12px; border-bottom:1px solid #222; }
-      .hw-wrap { display:flex; gap:10px; align-items:center; }
-      .hw-spacer { flex: 1 1 auto; }
-      .hw-btn { border:1px solid rgba(255,255,255,.08); background:rgba(255,255,255,.02);
-                padding:6px 10px; border-radius:10px; font-weight:600; color:#e5e7eb; }
-      .hw-btn.active { border-color:rgba(96,165,250,.6); color:#60a5fa; }
-      .stButton>button { all: unset; } /* remove default button styling */
-    </style>
-    <div class="hw-topbar"><div class="hw-wrap">""", unsafe_allow_html=True)
+    # ---- Parse inputs flexibly ----
+    is_authed = False
+    current = ""
+    on_sign_out = None
+    right_slot = None
 
-    # left cluster (render as inline buttons that switch pages)
-    cols = st.columns([0.12] * len(PAGES) + [1])  # last one is spacer/right area
-    # nav.py  (replace the for-loop body)
-    for i, (label, path) in enumerate(PAGES.items()):
-        with cols[i]:
-            is_active = (label == current)
-            btn_cls = "hw-btn active" if is_active else "hw-btn"
-            # style the actual Streamlit button
-            st.markdown(f"<style>div[data-testid='stButton']>button#{'nav_'+label}{{}}</style>", unsafe_allow_html=True)
-            if st.button(label, key=f"nav_{label}"):
-                if not is_active:
-                    st.switch_page(path)
-        # remove the extra markdown label you had before
+    # kwargs first
+    if "current" in kwargs: current = kwargs.get("current") or ""
+    if "on_sign_out" in kwargs: on_sign_out = kwargs.get("on_sign_out")
+    if "right_slot" in kwargs: right_slot = kwargs.get("right_slot")
+    if "is_authed" in kwargs: is_authed = bool(kwargs.get("is_authed"))
 
+    # positional inference
+    if args:
+        if isinstance(args[0], bool):                   # style A
+            is_authed = args[0]
+            if len(args) >= 2 and callable(args[1]): on_sign_out = args[1]
+            if len(args) >= 3 and isinstance(args[2], str): current = args[2]
+        elif isinstance(args[0], str):                  # style B
+            current = args[0]
+            if len(args) >= 2 and callable(args[1]): right_slot = args[1]
 
-    # right slot (e.g., sign-out button)
-    with cols[-1]:
-        st.markdown("<div class='hw-spacer'></div>", unsafe_allow_html=True)
-        if callable(right_slot):
-            right_slot()
+    on_sign_out = on_sign_out or right_slot or _default_signout
 
-    st.markdown("</div></div>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        <style>
+          section[data-testid="stSidebarNav"] { display:none; }
+          .hw-bar { display:flex; gap:12px; align-items:center; margin:6px 0 16px; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col1, col2 = st.columns([8, 2])
+    with col1:
+        _render_links(current_key=current)
+    with col2:
+        if is_authed:
+            if st.button("Sign out", use_container_width=True):
+                try:
+                    on_sign_out()
+                finally:
+                    st.switch_page("app.py")

@@ -1,9 +1,9 @@
-# telegram_bot/bot.py
 import os, logging, json, datetime as dt
 from typing import Optional, Tuple
 from dotenv import load_dotenv
 from supabase import create_client
 from postgrest.exceptions import APIError
+from zoneinfo import ZoneInfo
 
 from telegram import Update
 from telegram.ext import (
@@ -15,8 +15,8 @@ import google.generativeai as genai
 
 # =================== Env & Clients ===================
 load_dotenv()
-SUPABASE_URL  = os.getenv("SUPABASE_URL")
-SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # MUST be service role
+SUPABASE_URL   = os.getenv("SUPABASE_URL")
+SUPABASE_KEY   = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # MUST be service role
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not all([SUPABASE_URL, SUPABASE_KEY, TELEGRAM_TOKEN, GEMINI_API_KEY]):
@@ -39,6 +39,18 @@ def get_profile_for_telegram_id(tg_id: int):
     prof = sb.table("profiles").select("*").eq("id", data["user_id"]).maybe_single().execute()
     return getattr(prof, "data", None)
 
+def user_timezone(uid: str) -> ZoneInfo:
+    tz = "America/New_York"
+    try:
+        r = sb.table("hw_preferences").select("tz").eq("uid", uid).maybe_single().execute()
+        tz = (getattr(r, "data", {}) or {}).get("tz") or tz
+    except Exception:
+        pass
+    try:
+        return ZoneInfo(tz)
+    except Exception:
+        return ZoneInfo("America/New_York")
+
 def ensure_hw_user(uid: str, tg_id: Optional[int]):
     """Make sure hw_users has a row for this uid (FK target for hw_metrics)."""
     try:
@@ -49,22 +61,21 @@ def ensure_hw_user(uid: str, tg_id: Optional[int]):
     except Exception as e:
         log.info("ensure_hw_user skipped/failed: %s", e)
 
-def today_range_utc() -> Tuple[str, str]:
-    # UTC-aware window for “today”
-    now = dt.datetime.now(dt.timezone.utc)
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + dt.timedelta(days=1)
-    return start.isoformat(), end.isoformat()
+def today_range_for_user(tz: ZoneInfo) -> Tuple[str, str]:
+    # local -> UTC ISO window
+    now_l = dt.datetime.now(tz)
+    start_l = now_l.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_l = start_l + dt.timedelta(days=1)
+    return start_l.astimezone(dt.timezone.utc).isoformat(), end_l.astimezone(dt.timezone.utc).isoformat()
 
-def get_today_metrics(uid: str):
-    start, end = today_range_utc()
+def get_today_metrics(uid: str, tz: ZoneInfo):
+    start, end = today_range_for_user(tz)
     res = (sb.table("hw_metrics").select("*")
            .eq("uid", uid).gte("ts", start).lt("ts", end)
            .order("ts", desc=True).limit(1).execute())
     return (getattr(res, "data", None) or [None])[0]
 
 def _parse_items_kcal(text: str):
-    # Accepts "items; 400" or "oats banana 350" or "none"
     text = (text or "").strip()
     if text.lower() in ("none", "no", "nil", "na"):
         return None, 0
@@ -88,7 +99,7 @@ def upsert_meals(uid: str, day_meals: dict) -> bool:
     """
     try:
         rows = []
-        now_iso = dt.datetime.utcnow().isoformat()
+        now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
         for mtype in ["breakfast","lunch","dinner","snacks"]:
             m = (day_meals.get(mtype) or {})
             if m.get("items") or m.get("calories"):
@@ -106,10 +117,6 @@ def upsert_meals(uid: str, day_meals: dict) -> bool:
         return False
 
 def save_metrics(uid: str, answers: dict, tg_id_for_fix: Optional[int]):
-    """
-    Save 1 row to hw_metrics. If hw_meals absent, embed meals JSON.
-    Retries once if FK (23503) complains, by auto-creating hw_users row.
-    """
     total_cal = sum(int((answers["meals"].get(k) or {}).get("calories") or 0)
                     for k in ["breakfast","lunch","dinner","snacks"])
     meals_ok = upsert_meals(uid, answers["meals"])
@@ -132,7 +139,6 @@ def save_metrics(uid: str, answers: dict, tg_id_for_fix: Optional[int]):
         sb.table("hw_metrics").insert(payload).execute()
         log.info("Saved metrics for uid=%s (kcal=%s steps=%s sleep=%s)", uid, total_cal, answers.get("steps"), answers.get("sleep_minutes"))
     except APIError as e:
-        # FK to hw_users missing -> create and retry once
         if getattr(e, "code", "") == "23503" or "not present in table \"hw_users\"" in str(e):
             ensure_hw_user(uid, tg_id_for_fix)
             sb.table("hw_metrics").insert(payload).execute()
@@ -190,18 +196,15 @@ async def link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text("Invalid or expired code. Generate a fresh one in the website.")
 
         user_id_for_code = row["user_id"]
-        # upsert on telegram_id
         sb.table("tg_links").upsert(
             {"user_id": user_id_for_code, "telegram_id": tg_id, "link_code": code},
             on_conflict="telegram_id"
         ).execute()
 
-        # ensure FK parent for hw_metrics + provide tg for worker
         ensure_hw_user(user_id_for_code, tg_id)
         log.info("Linked telegram_id=%s to uid=%s", tg_id, user_id_for_code)
         return await update.message.reply_text("Linked! You can now receive personalized nudges.")
     except APIError:
-        # fallback update (rare older stack)
         sb.table("tg_links").update({"user_id": user_id_for_code, "link_code": code}).eq("telegram_id", tg_id).execute()
         ensure_hw_user(user_id_for_code, tg_id)
         log.info("Re-linked telegram_id=%s to uid=%s (fallback)", tg_id, user_id_for_code)
@@ -213,7 +216,7 @@ async def checkin_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not profile:
         return await update.message.reply_text("Please link your account first: /link <CODE>.")
 
-    ensure_hw_user(profile["id"], tg_id)  # make sure FK parent exists
+    ensure_hw_user(profile["id"], tg_id)
 
     ctx.user_data["checkin"] = {
         "uid": profile["id"],
@@ -311,8 +314,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not profile:
         return await update.message.reply_text("Please link your account first: /link <CODE> (from the website).")
 
-    # If no metrics today, offer a quick check-in
-    today = get_today_metrics(profile["id"])
+    # If no metrics today (by user's timezone), offer a quick check-in
+    tz = user_timezone(profile["id"])
+    today = get_today_metrics(profile["id"], tz)
     if not today:
         await update.message.reply_text("I don’t see today’s log. Want to do a quick /checkin ?")
 
@@ -351,7 +355,6 @@ def main():
             ASK_MEAL_QUALITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_workout)],
             ASK_WORKOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_hr)],
             ASK_HR: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_steps)],
-            ASK_STEPS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_sleep)],
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: ConversationHandler.END)],
     )

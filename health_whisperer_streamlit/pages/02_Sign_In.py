@@ -25,13 +25,13 @@ def get_sb():
     return create_client(url, key)
 sb = get_sb()
 
-def render_sign_out():  # new
-    if "sb_session" in st.session_state and st.button("Sign out"):
-        sb.auth.sign_out()
-        st.session_state.pop("sb_session", None)
-        st.switch_page("02_Sign_In.py")
+def on_sign_out():
+    sb.auth.sign_out()
+    st.session_state.pop("sb_session", None)
 
-top_nav(current="Sign In", right_slot=render_sign_out)
+is_authed = "sb_session" in st.session_state
+top_nav(is_authed, on_sign_out, current="Sign In")
+
 
 st.title("Welcome back")
 with st.form("signin"):

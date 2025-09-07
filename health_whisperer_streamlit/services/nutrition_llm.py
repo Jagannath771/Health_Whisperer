@@ -2,9 +2,9 @@
 import os, json, math
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
-
 import google.generativeai as genai
 from supabase import create_client
+from zoneinfo import ZoneInfo
 
 # ---------- Setup ----------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -13,13 +13,24 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not (SUPABASE_URL and SUPABASE_KEY):
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
-
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 if not GEMINI_API_KEY:
     raise RuntimeError("Missing GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
-MODEL = genai.GenerativeModel("gemini-1.5-flash")
+
+SYSTEM_INSTRUCTION = """You are a nutrition estimator. Parse the user's meal text into JSON that matches the provided schema.
+Infer portion sizes in grams and estimate nutrition WITHOUT asking questions.
+Use regional dish knowledge (e.g., pesarattu is a moong-dal crepe).
+Account for oils/chutneys mentioned.
+Return ONLY minified JSON (no prose), strictly following the schema.
+If something is unknown, make a best-effort estimate rather than leaving it blank.
+"""
+
+MODEL = genai.GenerativeModel(
+    model_name="gemini-1.5-flash",
+    system_instruction=SYSTEM_INSTRUCTION
+)
 
 # ---------- Helpers ----------
 def _now_utc():
@@ -35,12 +46,10 @@ def _clamp(v, lo, hi):
     except:
         return lo
 
-# Convert a JSON-like string to dict safely
 def _parse_json(text: str) -> dict:
     try:
         return json.loads(text)
     except Exception:
-        # best effort: extract between first and last {...}
         start = text.find("{")
         end = text.rfind("}")
         if start >= 0 and end > start:
@@ -50,7 +59,6 @@ def _parse_json(text: str) -> dict:
                 return {}
         return {}
 
-# ---------- LLM prompts ----------
 SCHEMA = {
   "type": "object",
   "properties": {
@@ -61,7 +69,7 @@ SCHEMA = {
         "type": "object",
         "properties": {
           "name": {"type": "string"},
-          "qty_g": {"type": "number"},        # grams inferred (no hard-coded mapping)
+          "qty_g": {"type": "number"},
           "notes": {"type": "string"}
         },
         "required": ["name", "qty_g"]
@@ -84,62 +92,46 @@ SCHEMA = {
   "required": ["items"]
 }
 
-SYSTEM = """You are a nutrition estimator. Parse the user's meal text into JSON that matches the provided schema.
-Infer portion sizes in grams and estimate nutrition WITHOUT asking questions. 
-Use regional dish knowledge (e.g., pesarattu is a moong-dal crepe). 
-Account for oils/chutneys mentioned. 
-Return ONLY minified JSON (no prose), strictly following the schema."""
-
 def llm_extract_meal(text: str) -> dict:
-    user = f"Text: {text}\nSchema (JSON): {json.dumps(SCHEMA)}\nReturn only JSON."
-    out = MODEL.generate_content([{"role":"system","parts":[SYSTEM]},
-                                  {"role":"user","parts":[user]}])
-    raw = out.text.strip() if hasattr(out, "text") else "{}"
+    user = (
+        "Parse the following meal into the schema below. "
+        "Return only compact JSON, no prose.\n\n"
+        f"Text: {text}\n\nSchema (JSON): {json.dumps(SCHEMA)}"
+    )
+    out = MODEL.generate_content(user)
+    raw = out.text.strip() if hasattr(out, "text") and out.text else "{}"
     data = _parse_json(raw)
-    # fill sane defaults
     data.setdefault("meal_type", "unknown")
     data.setdefault("items", [])
     data.setdefault("totals", {})
-    data["confidence"] = _clamp(data.get("confidence", 0.6), 0.0, 1.0)
+    data["confidence"] = _clamp(data.get("confidence", 0.7), 0.0, 1.0)
     return data
 
-# ---------- Reference lookup (optional) ----------
+# Optional reference lookup (kept for better estimates later)
 def _embed(text: str) -> List[float]:
-    # Gemini embeddings: 768 dims for text-embedding-004
     e = genai.embed_content(model="text-embedding-004", content=text)
     return e["embedding"]["values"]
 
 def _search_food_reference(query: str, top_k: int = 3) -> List[dict]:
-    v = _embed(query)
-    res = sb.rpc("match_foods", {"query_embedding": v, "match_count": top_k}).execute()
-    # If you don't want to define a RPC, fallback to simple ILIKE match:
-    if getattr(res, "data", None):
-        return res.data
-    # Fallback: naive alias search
+    try:
+        v = _embed(query)
+        res = sb.rpc("match_foods", {"query_embedding": v, "match_count": top_k}).execute()
+        if getattr(res, "data", None):
+            return res.data
+    except Exception:
+        pass
     alt = sb.table("hw_food_nutrition").select("*").ilike("food_name", f"%{query}%").limit(top_k).execute().data or []
     return alt
 
-# (create this SQL function once if you want vector search)
-# select id, food_name, aliases, base_qty_g, calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg, micros
-# from hw_food_nutrition
-# order by embedding <=> query_embedding
-# limit match_count;
-
-# ---------- Nutrition estimation & save ----------
 def estimate_meal(text: str) -> dict:
     """
     1) LLM parses & estimates portions + totals.
-    2) (Optional) For each item, we try to refine using closest food reference row per 100g.
-       If found, we adjust totals based on qty_g.
-       If not found, keep LLM estimate.
+    2) If totals are missing, estimate via references per 100g.
     """
     data = llm_extract_meal(text)
     items = data.get("items", [])
     totals = data.get("totals") or {}
-    # If LLM didn't include totals, compute from references where possible:
     agg = {k: 0.0 for k in ["calories","protein_g","carbs_g","fat_g","fiber_g","sugar_g","sodium_mg"]}
-
-    # If LLM gave totals with reasonable numbers, adopt them; else recompute
     llm_totals_ok = "calories" in totals and totals["calories"] and totals["calories"] > 0
 
     if not llm_totals_ok:
@@ -157,16 +149,6 @@ def estimate_meal(text: str) -> dict:
                     val = r.get(k)
                     if val is not None:
                         agg[k] += float(val) * scale
-            else:
-                # No reference found; ask LLM for per-100g macros for this item
-                sub = MODEL.generate_content(f"Give per-100g estimate as JSON: "
-                                             f'{{"calories":...,"protein_g":...,"carbs_g":...,"fat_g":...,"fiber_g":...,"sugar_g":...,"sodium_mg":...}} '
-                                             f"for: {name}. No prose.")
-                ref = _parse_json(getattr(sub, "text", "{}"))
-                for k in agg.keys():
-                    val = ref.get(k)
-                    if val is not None:
-                        agg[k] += float(val) * (qty_g / 100.0)
         totals = {k: int(round(v)) for k, v in agg.items()}
         data["totals"] = totals
 
@@ -177,7 +159,7 @@ def save_meal(uid: str, raw_text: str, parsed: dict, when_utc: Optional[datetime
     mt = meal_type or parsed.get("meal_type") or "unknown"
     totals = parsed.get("totals") or {}
     items = parsed.get("items") or []
-    conf = float(parsed.get("confidence") or 0.6)
+    conf = float(parsed.get("confidence") or 0.7)
 
     payload = {
         "uid": uid,
@@ -199,39 +181,71 @@ def save_meal(uid: str, raw_text: str, parsed: dict, when_utc: Optional[datetime
     sb.table("hw_meals").insert(payload).execute()
     return payload
 
-def upsert_today_totals(uid: str):
-    """
-    Aggregate today's meals and upsert totals into hw_metrics so your dashboard/worker see them.
-    """
-    # Pull meals for the last 24h
-    since = (_now_utc() - timedelta(hours=24)).isoformat()
-    meals = sb.table("hw_meals").select("calories,protein_g,carbs_g,fat_g,fiber_g,sugar_g,sodium_mg")\
-               .eq("uid", uid).gte("ts", since).execute().data or []
+def _user_tz(sb, uid: str) -> ZoneInfo:
+    try:
+        r = sb.table("hw_preferences").select("tz").eq("uid", uid).maybe_single().execute()
+        tz = (r.data or {}).get("tz") or "America/New_York"
+    except Exception:
+        tz = "America/New_York"
+    try:
+        return ZoneInfo(tz)
+    except Exception:
+        return ZoneInfo("America/New_York")
 
+def _today_bounds_local_utc(uid: str):
+    tz = _user_tz(sb, uid)
+    now_local = datetime.now(timezone.utc).astimezone(tz)
+    start_local = datetime(now_local.year, now_local.month, now_local.day, tzinfo=tz)
+    return start_local.astimezone(timezone.utc).isoformat(), now_local.astimezone(timezone.utc).isoformat()
+
+def upsert_today_totals(uid: str):
+    start_iso, now_iso = _today_bounds_local_utc(uid)
+    meals = (
+        sb.table("hw_meals")
+        .select("calories,protein_g,carbs_g,fat_g,fiber_g,sugar_g,sodium_mg")
+        .eq("uid", uid)
+        .gte("ts", start_iso)
+        .lte("ts", now_iso)
+        .execute().data or []
+    )
     def s(key): return sum(int(m.get(key) or 0) for m in meals)
-    totals = {
-        "calories": s("calories"),
-        "protein_g": s("protein_g"),
-        "carbs_g": s("carbs_g"),
-        "fat_g": s("fat_g"),
-        "fiber_g": s("fiber_g"),
-        "sugar_g": s("sugar_g"),
-        "sodium_mg": s("sodium_mg"),
-    }
-    # Write a metrics row (source=aggregate)
+    totals = {k: s(k) for k in ["calories","protein_g","carbs_g","fat_g","fiber_g","sugar_g","sodium_mg"]}
+
     sb.table("hw_metrics").insert({
         "uid": uid,
         "source": "aggregate",
         "calories": totals["calories"],
-        # you can add more columns to hw_metrics later (protein_g, etc.) if you wish
-        "notes": "auto-upsert from meals aggregation"
+        "notes": "auto-upsert from meals aggregation (today, local)"
     }).execute()
     return totals
 
 def parse_and_log(uid: str, meal_text: str, meal_type_hint: Optional[str] = None):
+    """
+    Parse meal text with Gemini, save to hw_meals, upsert today's totals to hw_metrics,
+    and emit a real-time event so the nudge worker can react immediately.
+    """
     parsed = estimate_meal(meal_text)
     if meal_type_hint and parsed.get("meal_type", "unknown") == "unknown":
         parsed["meal_type"] = meal_type_hint
+
     saved = save_meal(uid, meal_text, parsed)
     totals = upsert_today_totals(uid)
+
+    # Emit RT event for nudges
+    try:
+        sb.table("hw_events").insert({
+            "uid": uid,
+            "kind": "meal_logged",
+            "payload": {
+                "meal_type": saved.get("meal_type"),
+                "calories": saved.get("calories"),
+                "protein_g": saved.get("protein_g"),
+                "sugar_g": saved.get("sugar_g"),
+                "ts": saved.get("ts"),
+                "raw_text": meal_text
+            }
+        }).execute()
+    except Exception:
+        pass
+
     return {"saved": saved, "day_totals": totals, "parsed": parsed}

@@ -27,16 +27,13 @@ def get_sb():
     return create_client(url, key)
 sb = get_sb()
 
-def render_sign_out():
-    if "sb_session" in st.session_state and st.button("Sign out"):
-        sb.auth.sign_out()
-        st.session_state.pop("sb_session", None)
-        st.switch_page("health_whisperer_streamlit/pages/04_Get_Started.py")    # or "06_Log_Metrics.py" on that page
-        st.switch_page("health_whisperer_streamlit/pages/02_Sign_In.py")
+def on_sign_out():
+    sb.auth.sign_out()
+    st.session_state.pop("sb_session", None)
 
+is_authed = "sb_session" in st.session_state
+top_nav(is_authed, on_sign_out, current="Get Started")
 
-
-top_nav(current="Get Started", right_slot=render_sign_out)
 
 def require_login():
     if "sb_session" not in st.session_state:

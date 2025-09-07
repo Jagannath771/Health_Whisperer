@@ -25,15 +25,13 @@ def get_sb():
     return create_client(url, key)
 sb = get_sb()
 
-def render_sign_out():
-    if "sb_session" in st.session_state and st.button("Sign out"):
-        sb.auth.sign_out()
-        st.session_state.pop("sb_session", None)
-        st.switch_page("health_whisperer_streamlit/pages/07_Preferences.py")     # or "06_Log_Metrics.py" on that page
-        st.switch_page("pages/02_Sign_In.py")   # ✅ always exists and is in /pages
+def on_sign_out():
+    sb.auth.sign_out()
+    st.session_state.pop("sb_session", None)
 
+is_authed = "sb_session" in st.session_state
+top_nav(is_authed, on_sign_out, current="Preferences")
 
-top_nav(current="Preferences", right_slot=render_sign_out)
 
 # -------------------- Auth Guard --------------------
 if "sb_session" not in st.session_state:
