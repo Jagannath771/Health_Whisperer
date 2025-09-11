@@ -1,4 +1,4 @@
-Awesome — here’s a polished, copy-paste-ready **README.md** tailored to your current Health Whisperer repo.
+
 
 ```markdown
 # Health Whisperer — MVP Starter
