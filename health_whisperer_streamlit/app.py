@@ -99,7 +99,12 @@ with c3:
     st.page_link("pages/05_Dashboard.py", label="Open Dashboard →", icon="📊")
 
 st.divider()
-
+st.divider()
+n1, n2 = st.columns(2)
+with n1:
+    st.markdown("### 🔔 Notifications")
+    st.write("See your in-app nudges and mark them as read.")
+    st.page_link("pages/08_Notifications.py", label="Open Notifications →", icon="🔔")
 p, s = st.columns(2)
 with p:
     st.subheader("The Problem")

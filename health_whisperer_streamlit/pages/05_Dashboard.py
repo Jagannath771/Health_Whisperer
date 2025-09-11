@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 from supabase import create_client
 from httpx import ReadError
+import matplotlib.pyplot as plt
 
 from nav import top_nav
 
@@ -16,7 +17,7 @@ st.set_page_config(page_title="Dashboard - Health Whisperer",
                    initial_sidebar_state="collapsed")
 st.markdown("<style>section[data-testid='stSidebarNav']{display:none;}</style>", unsafe_allow_html=True)
 
-# ===== Retry helper for Supabase (handles WinError 10035 ReadError) =====
+# ===== Retry helper =====
 def exec_with_retry(req, tries: int = 3, base_delay: float = 0.4):
     for i in range(tries):
         try:
@@ -81,23 +82,14 @@ def _fmt_ts(ts_iso: str | None) -> str:
     except Exception:
         return ts_iso
 
-# ===== Robust timestamp parsing =====
+# ===== Robust parsing & numeric helpers =====
 def _to_dt(series: pd.Series) -> pd.Series:
-    # Parse ISO8601 variants like "...Z" or "+00:00"; keep tz-aware in UTC
     return pd.to_datetime(series, format="ISO8601", utc=True, errors="coerce")
 
-# ===== Numeric safety helpers =====
 def _to_num(series: pd.Series) -> pd.Series:
-    # Coerce to numeric and keep NaN for later handling
     return pd.to_numeric(series, errors="coerce")
 
 def _safe_max(series: pd.Series | None, default: int | float = 0):
-    """
-    Returns a safe max:
-      - if series is None or empty -> default
-      - if all values are NaN -> default
-      - else -> max ignoring NaN
-    """
     if series is None:
         return default
     s = _to_num(series)
@@ -128,7 +120,6 @@ def load_meals(uid: str, days_back: int = 14) -> pd.DataFrame:
         return pd.DataFrame(columns=["ts","meal_type","calories","protein_g","carbs_g","fat_g","fiber_g","sugar_g","sodium_mg","items","raw_text"])
     df = pd.DataFrame(rows)
     df["ts"] = _to_dt(df["ts"])
-    # Ensure key nutrient columns are numeric
     for col in ["calories","protein_g","carbs_g","fat_g","fiber_g","sugar_g","sodium_mg"]:
         if col in df.columns:
             df[col] = _to_num(df[col])
@@ -161,8 +152,9 @@ def get_prefs(uid: str) -> dict:
 
 # ===== Load everything =====
 prefs = get_prefs(uid)
-meals_df = load_meals(uid, days_back=14)
-metrics_df = load_metrics(uid, days_back=14)
+meals_df = load_meals(uid, days_back=30)
+metrics_df = load_metrics(uid, days_back=30)
+profile = (sb.table("profiles").select("*").eq("id", uid).maybe_single().execute().data or {})
 
 # ===== Today overview =====
 tz = _user_tz(uid)
@@ -179,12 +171,10 @@ water_goal = int(prefs.get("daily_water_ml") or 2000)
 steps_goal = int(prefs.get("daily_step_goal") or 8000)
 sleep_goal = int(prefs.get("sleep_goal_min") or 420)
 
-# ---- SAFE totals/max (prevents ValueError: cannot convert float NaN to integer)
 today_kcal  = int(_safe_sum(today_meals.get("calories")))
 today_water = int(_safe_max(today_metrics.get("water_ml")))
 today_steps = int(_safe_max(today_metrics.get("steps")))
 today_sleep = int(_safe_max(today_metrics.get("sleep_minutes")))
-# Mood is often small ints; keep as int if available else "—"
 _mood_val = _safe_max(today_metrics.get("mood"))
 today_mood = None if _mood_val in (0, None) else int(_mood_val)
 
@@ -197,8 +187,8 @@ e.metric("Mood",     today_mood if today_mood is not None else "—")
 
 st.divider()
 
-# ===== Calories by day (last 14) =====
-st.subheader("Calories (last 14 days)")
+# ===== Calories by day (last 30) =====
+st.subheader("Calories (last 30 days)")
 if not meals_df.empty and "calories" in meals_df.columns:
     meals_df["date"] = meals_df["ts"].dt.tz_convert("UTC").dt.date
     cal_day = (meals_df.groupby("date", as_index=False)["calories"]
@@ -210,7 +200,7 @@ else:
 # ===== Steps & Water by day =====
 c1, c2 = st.columns(2)
 with c1:
-    st.subheader("Steps (last 14 days)")
+    st.subheader("Steps (last 30 days)")
     if not metrics_df.empty and "steps" in metrics_df.columns:
         m = metrics_df.copy()
         m["date"] = m["ts"].dt.tz_convert("UTC").dt.date
@@ -220,7 +210,7 @@ with c1:
         st.info("No metrics yet.")
 
 with c2:
-    st.subheader("Water (ml, last 14 days)")
+    st.subheader("Water (ml, last 30 days)")
     if not metrics_df.empty and "water_ml" in metrics_df.columns:
         m = metrics_df.copy()
         m["date"] = m["ts"].dt.tz_convert("UTC").dt.date
@@ -247,18 +237,201 @@ else:
         fiber_txt = f" • Fiber:{fiber_val}" if fiber_val else ""
         st.markdown(f"**{ts_local}** — **{kcal} kcal** (P:{p} C:{c} F:{f}){fiber_txt}")
 
-        items = row.get("items") or []
-        if isinstance(items, str):
-            # try to show parsed items if json was stored as string
-            try:
-                import json
-                items = json.loads(items)
-            except Exception:
-                items = []
-        for it in (items or []):
-            name = it.get("name") if isinstance(it, dict) else str(it)
-            qty  = (it.get("qty_g") if isinstance(it, dict) else None)
-            note = (it.get("notes") if isinstance(it, dict) else None)
-            qtxt = f" ({int(qty)} g)" if qty not in (None, "", 0) and not pd.isna(qty) else ""
-            ntxt = f" — {note}" if note else ""
-            st.write(f"- {name}{qtxt}{ntxt}")
+# ======================================================================
+# ===================  Gamification & Engagement  ======================
+# ======================================================================
+
+def goal_hits_by_day(metrics_df: pd.DataFrame, prefs: dict) -> pd.DataFrame:
+    if metrics_df.empty:
+        return pd.DataFrame(columns=["day","steps_hit","water_hit","sleep_hit","any_hit","steps","water_ml","sleep_minutes"])
+    df = metrics_df.copy()
+    df["day"] = df["ts"].dt.tz_convert(timezone.utc).dt.date
+    agg = df.groupby("day").agg({
+        "steps":"max","water_ml":"max","sleep_minutes":"max"
+    }).reset_index()
+    steps_goal = int(prefs.get("daily_step_goal") or 8000)
+    water_goal = int(prefs.get("daily_water_ml") or 2000)
+    sleep_goal = int(prefs.get("sleep_goal_min") or 420)
+    agg["steps_hit"] = (agg["steps"] >= steps_goal)
+    agg["water_hit"] = (agg["water_ml"] >= water_goal)
+    agg["sleep_hit"] = (agg["sleep_minutes"] >= sleep_goal)
+    agg["any_hit"]   = agg[["steps_hit","water_hit","sleep_hit"]].any(axis=1)
+    return agg.sort_values("day")
+
+def current_streak(hit_series: pd.Series) -> int:
+    cnt = 0
+    for ok in reversed(list(hit_series)):
+        if ok: cnt += 1
+        else: break
+    return cnt
+
+BADGE_RULES = [
+    ("WATER_7D", "Hydration Hero (7-day)", lambda hits: int(hits["water_hit"].tail(7).sum()) >= 7),
+    ("STEPS_10K", "10k Steps Day",        lambda hits: ((hits["steps"] >= 10000).tail(1).any()) or (hits["steps_hit"].tail(1).any())),
+    ("SLEEP_7x",  "Sleep Consistency",    lambda hits: int(hits["sleep_hit"].tail(7).sum()) >= 5),
+]
+
+def evaluate_badges(uid: str, hits: pd.DataFrame):
+    earned = []
+    for code, label, rule in BADGE_RULES:
+        try:
+            if not hits.empty and rule(hits):
+                earned.append((code,label))
+        except Exception:
+            pass
+    for code, label in earned:
+        try:
+            sb.table("hw_badges").upsert({
+                "uid": uid, "code": code, "earned_on": datetime.now(timezone.utc).date()
+            }, on_conflict="uid,code").execute()
+        except Exception:
+            pass
+    return earned
+
+def weekly_summary(hits: pd.DataFrame) -> dict:
+    last7 = hits.tail(7)
+    if last7.empty:
+        return {"water": 0, "steps": 0, "sleep": 0}
+    return {
+        "water": int(last7["water_hit"].sum()),
+        "steps": int(last7["steps_hit"].sum()),
+        "sleep": int(last7["sleep_hit"].sum())
+    }
+
+st.divider()
+st.subheader("Engagement")
+
+hits = goal_hits_by_day(metrics_df, prefs)
+streak_any = current_streak(hits["any_hit"]) if not hits.empty else 0
+w = weekly_summary(hits)
+g1, g2, g3 = st.columns(3)
+g1.success(f"🔥 Streak (any goal): {streak_any} days")
+g2.info(f"💧 Hydration days (7d): {w['water']}/7")
+g3.info(f"🚶 Steps days (7d): {w['steps']}/7")
+
+earned = evaluate_badges(uid, hits)
+if earned:
+    st.balloons()
+    st.success("New badges unlocked: " + ", ".join(lbl for _, lbl in earned))
+else:
+    st.caption("Keep going to unlock badges like **Hydration Hero**, **Sleep Consistency**, and a **10k Steps Day**!")
+
+# ======================================================================
+# ===================    Digital Twin: Future You     ==================
+# ======================================================================
+
+st.divider()
+st.subheader("Future You — 6-month projection (multi-factor)")
+
+def activity_factor(level: str) -> float:
+    m = {
+        "Sedentary": 1.2, "Lightly active": 1.375, "Moderately active": 1.55,
+        "Very active": 1.725, "Athlete": 1.9
+    }
+    if not level:
+        return 1.2
+    for k,v in m.items():
+        if k.lower() in str(level).lower():
+            return v
+    return 1.2
+
+# ---- Build 14–30d baselines
+kcal_daily = metrics_df.groupby(metrics_df["ts"].dt.date)["calories"].max(numeric_only=True) if not metrics_df.empty else pd.Series(dtype=float)
+steps_daily = metrics_df.groupby(metrics_df["ts"].dt.date)["steps"].max(numeric_only=True) if not metrics_df.empty else pd.Series(dtype=float)
+water_daily = metrics_df.groupby(metrics_df["ts"].dt.date)["water_ml"].max(numeric_only=True) if not metrics_df.empty else pd.Series(dtype=float)
+sleep_daily = metrics_df.groupby(metrics_df["ts"].dt.date)["sleep_minutes"].max(numeric_only=True) if not metrics_df.empty else pd.Series(dtype=float)
+mood_daily  = metrics_df.groupby(metrics_df["ts"].dt.date)["mood"].max(numeric_only=True) if not metrics_df.empty else pd.Series(dtype=float)
+mealq_daily = metrics_df.groupby(metrics_df["ts"].dt.date)["meal_quality"].max(numeric_only=True) if not metrics_df.empty else pd.Series(dtype=float)
+
+kcal_avg  = float(kcal_daily.mean())  if not kcal_daily.empty  else 2000.0
+steps_avg = float(steps_daily.mean()) if not steps_daily.empty else 6000.0
+water_avg = float(water_daily.mean()) if not water_daily.empty else 1200.0
+sleep_avg = float(sleep_daily.mean()) if not sleep_daily.empty else 360.0  # 6h default
+mood_avg  = float(mood_daily.mean())  if not mood_daily.empty  else 3.0
+mealq_avg = float(mealq_daily.mean()) if not mealq_daily.empty else 3.0
+
+# ---- Multi-factor adjustments
+def estimate_tdee(profile: dict, steps_avg: float, sleep_avg: float, water_avg: float) -> float:
+    # Mifflin-St Jeor BMR
+    age = int(profile.get("age") or 30)
+    h = float(profile.get("height_cm") or 170.0)
+    w = float(profile.get("weight_kg") or 75.0)
+    gender = (profile.get("gender") or "").lower()
+    bmr = 10*w + 6.25*h - 5*age + (5 if gender.startswith("m") else -161 if gender.startswith("f") else -78)
+    af = activity_factor(profile.get("activity_level"))
+
+    # Steps bonus (~+80 kcal per +2k steps/day)
+    steps_bonus = 80.0 * max(0.0, (steps_avg - 6000.0) / 2000.0)
+
+    # Sleep penalty (sleep debt reduces energy expenditure / activity)
+    sleep_pen = -100.0 if sleep_avg < 360 else (-50.0 if sleep_avg < 420 else 0.0)
+
+    # Hydration effect (mild): if very low, small penalty
+    water_pen = -40.0 if water_avg < 1000 else 0.0
+
+    return bmr * af + steps_bonus + sleep_pen + water_pen
+
+def adherence_multiplier(mood_avg: float, mealq_avg: float, streak_any: int) -> float:
+    """
+    Models how well you stick to a plan:
+      - Lower mood tends to reduce adherence
+      - Better meal quality improves it
+      - Streak momentum helps
+    """
+    mood_term = 0.92 if mood_avg < 3 else (1.0 if mood_avg < 4 else 1.03)
+    meal_term = 0.96 if mealq_avg < 3 else (1.0 if mealq_avg < 4 else 1.04)
+    streak_term = min(1.08, 1.0 + 0.01 * min(30, streak_any))  # +1% per day up to +8%
+    return mood_term * meal_term * streak_term
+
+def project_weight_series(profile: dict, kcal_intake: float, steps_avg: float,
+                          sleep_avg: float, water_avg: float,
+                          delta_steps: int = 2000, days: int = 180,
+                          adherence: float = 1.0) -> list[float]:
+    w0 = float(profile.get("weight_kg") or 75.0)
+    tdee0 = estimate_tdee(profile, steps_avg, sleep_avg, water_avg)
+    kcal_extra = 80.0 * (delta_steps / 2000.0)  # rough steps→kcal mapping
+    series = []
+    w = w0
+    for _ in range(days+1):
+        # adherence applies to both intake AND activity deltas (behavior realism)
+        tdee = tdee0 + (kcal_extra * adherence)
+        intake = kcal_intake * adherence + kcal_intake * (1 - adherence)  # same intake; multiplier influences deltas above
+        delta_kg = (intake - tdee) / 7700.0
+        w = max(35.0, w + delta_kg)
+        series.append(w)
+    return series
+
+def bmi_series(kg_series: list[float], height_cm: float) -> list[float]:
+    m2 = (height_cm/100.0)**2
+    return [round(w/m2, 1) for w in kg_series]
+
+delta_steps = st.slider("Additional steps per day", 0, 5000, 2000, 500)
+adherence = adherence_multiplier(mood_avg, mealq_avg, streak_any)
+
+series_base = project_weight_series(profile, kcal_avg, steps_avg, sleep_avg, water_avg,
+                                    delta_steps=0, days=180, adherence=adherence)
+series_bump = project_weight_series(profile, kcal_avg, steps_avg, sleep_avg, water_avg,
+                                    delta_steps=delta_steps, days=180, adherence=adherence)
+
+height_cm = float(profile.get("height_cm") or 170.0)
+bmi_base = bmi_series(series_base, height_cm)
+bmi_bump = bmi_series(series_bump, height_cm)
+
+fig, ax = plt.subplots()
+ax.plot(range(181), series_base, label="Current routine (kg)")
+ax.plot(range(181), series_bump, label=f"+{delta_steps} steps/day (kg)")
+ax.set_xlabel("Days")
+ax.set_ylabel("Weight (kg)")
+ax.legend()
+st.pyplot(fig)
+
+b0, b1 = bmi_base[-1], bmi_bump[-1]
+w0, w1 = series_base[-1], series_bump[-1]
+
+st.info(
+    f"**Multi-factor model** — uses your average calories ({kcal_avg:.0f}), steps ({steps_avg:.0f}/day), "
+    f"sleep ({sleep_avg:.0f} min), water ({water_avg:.0f} ml), mood ({mood_avg:.1f}/5), meal quality ({mealq_avg:.1f}/5) and streak momentum.\n\n"
+    f"At current pace → ~**{w0:.1f} kg** (BMI {b0}).  "
+    f"With +{delta_steps} steps/day → ~**{w1:.1f} kg** (BMI {b1}).  "
+    f"_This is a simplified trend model — use direction, not absolutes._"
+)

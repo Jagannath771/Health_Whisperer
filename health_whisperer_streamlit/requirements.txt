@@ -7,3 +7,5 @@ python-telegram-bot==21.4
 google-generativeai>=0.7.0
 pytz==2024.1
 matplotlib
+icalendar
+python-dateutil==2.9.0.post0

@@ -1,292 +1,248 @@
 # pages/07_Preferences.py
-import math
+import time
+from datetime import datetime, time as dt_time, timezone
+from zoneinfo import ZoneInfo
+
 import streamlit as st
+import pandas as pd
 from supabase import create_client
+from httpx import ReadError
+
 from nav import top_nav
 
-# -------------------- Page & Styles --------------------
-st.set_page_config(
-    page_title="Preferences - Health Whisperer",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-st.markdown("""
-<style>
-/* hide page links in sidebar */
-section[data-testid="stSidebarNav"] { display:none; }
-</style>
-""", unsafe_allow_html=True)
+# ================= Page config =================
+st.set_page_config(page_title="Preferences - Health Whisperer",
+                   layout="wide",
+                   initial_sidebar_state="collapsed")
+st.markdown("<style>section[data-testid='stSidebarNav']{display:none;}</style>", unsafe_allow_html=True)
 
-# -------------------- Supabase --------------------
+# ================= Helpers =================
+def exec_with_retry(req, tries: int = 3, base_delay: float = 0.4):
+    for i in range(tries):
+        try:
+            return req.execute()
+        except Exception as e:
+            msg = str(e)
+            if "10035" in msg or isinstance(e, ReadError):
+                time.sleep(base_delay * (i + 1))
+                continue
+            raise
+    return req.execute()
+
 @st.cache_resource
 def get_sb():
     url = st.secrets["supabase"]["url"]
     key = st.secrets["supabase"]["key"]
     return create_client(url, key)
+
 sb = get_sb()
 
+def _user_tz(uid: str) -> ZoneInfo:
+    try:
+        r = exec_with_retry(sb.table("hw_preferences").select("tz").eq("uid", uid).maybe_single())
+        tz = (r.data or {}).get("tz") or "America/New_York"
+    except Exception:
+        tz = "America/New_York"
+    try:
+        return ZoneInfo(tz)
+    except Exception:
+        return ZoneInfo("America/New_York")
+
+def _time_to_str(t: dt_time | None) -> str:
+    if not t: return "22:00"
+    return f"{t.hour:02d}:{t.minute:02d}"
+
+def _str_to_time(s: str | None, fallback: str) -> dt_time:
+    s = (s or fallback or "22:00").strip()
+    try:
+        hh, mm = s.split(":")[:2]
+        return dt_time(int(hh), int(mm))
+    except Exception:
+        # fallback if stored as "22:00:00"
+        try:
+            hh, mm, _ss = s.split(":")[:3]
+            return dt_time(int(hh), int(mm))
+        except Exception:
+            return dt_time(22, 0)
+
+# ================= Auth / Nav =================
 def on_sign_out():
     sb.auth.sign_out()
     st.session_state.pop("sb_session", None)
 
 is_authed = "sb_session" in st.session_state
 top_nav(is_authed, on_sign_out, current="Preferences")
-
-
-# -------------------- Auth Guard --------------------
-if "sb_session" not in st.session_state:
+if not is_authed:
     st.warning("Please sign in first.")
     st.switch_page("pages/02_Sign_In.py")
     st.stop()
 
 uid = st.session_state["sb_session"]["user_id"]
 
-# -------------------- Helpers --------------------
-DEFAULT_GOALS = {
-    # activity
-    "steps": 8000,
-    # hydration (stored in ml)
-    "water_ml": 2500,
-    # sleep (stored in minutes)
-    "sleep_minutes": 420,
-    # diet
-    "calories": 2000,         # kcal/day
-    "protein": 75,            # g/day
-    "sugar": 50,              # g/day (added sugar limit)
-    # mental health
-    "journaling": "None",     # None | Daily | 3x/week | Weekly
-    "meditation": 10,         # minutes/day
-    "mood_target": 3.5,       # 1.0–5.0 average target
-}
+# ================= Load current prefs =================
+pref_row = {}
+try:
+    r = exec_with_retry(sb.table("hw_preferences").select("*").eq("uid", uid).maybe_single())
+    pref_row = r.data or {}
+except Exception:
+    pref_row = {}
 
-def _safe_goals_merge(raw: dict | None) -> dict:
-    """Merge stored goals with defaults and normalize keys."""
-    g = dict(DEFAULT_GOALS)
-    if isinstance(raw, dict):
-        # known numeric keys
-        for k in ["steps", "water_ml", "sleep_minutes", "calories", "protein", "sugar", "meditation"]:
-            if k in raw and raw[k] is not None:
-                try:
-                    g[k] = int(raw[k])
-                except:
-                    pass
-        # float target for mood (allow 1 decimal)
-        if "mood_target" in raw and raw["mood_target"] is not None:
-            try:
-                g["mood_target"] = float(raw["mood_target"])
-            except:
-                pass
-        # journaling frequency
-        if "journaling" in raw and raw["journaling"]:
-            g["journaling"] = str(raw["journaling"])
-    return g
-
-def read_hw_preferences(uid: str):
-    """Read full hw_preferences row if exists; else None."""
-    try:
-        res = sb.table("hw_preferences").select("*").eq("uid", uid).maybe_single().execute()
-        return getattr(res, "data", None)
-    except Exception:
-        return None
-
-def read_profile_goals_text(uid: str) -> dict:
-    """
-    Fallback: parse profiles.goals like 'steps_goal:8000; water_goal:8; sleep_goal:420'
-    We'll interpret a small water value as glasses and convert → ml.
-    """
-    try:
-        res = sb.table("profiles").select("goals").eq("id", uid).maybe_single().execute()
-        txt = ((getattr(res, "data", None) or {}).get("goals") or "").strip()
-    except Exception:
-        txt = ""
-
-    g = dict(DEFAULT_GOALS)
-    if not txt:
-        return g
-
-    for tok in txt.split(";"):
-        k, _, v = tok.strip().partition(":")
-        k = k.strip().lower()
-        v = v.strip()
-        if not v:
-            continue
-        try:
-            iv = int(v)
-        except:
-            iv = None
-
-        if "step" in k and iv is not None:
-            g["steps"] = iv
-        elif "water" in k and iv is not None:
-            # If small number, treat as glasses (≈250 ml per glass)
-            g["water_ml"] = iv if iv > 50 else iv * 250
-        elif "sleep" in k and iv is not None:
-            g["sleep_minutes"] = iv
-        elif "cal" in k and iv is not None:
-            g["calories"] = iv
-    return g
-
-# -------------------- Load Preferences --------------------
-pref_row = read_hw_preferences(uid)
-
-pref = {
-    "nudge_channel": "telegram",
-    "nudge_cadence": "smart",
-    "nudge_tone": "gentle",
-    "quiet_start": "22:00",
-    "quiet_end": "07:00",
-    "goals": dict(DEFAULT_GOALS),
-}
-
-if pref_row:
-    pref["nudge_channel"] = pref_row.get("nudge_channel", pref["nudge_channel"])
-    pref["nudge_cadence"] = pref_row.get("nudge_cadence", pref["nudge_cadence"])
-    pref["nudge_tone"] = pref_row.get("nudge_tone", pref["nudge_tone"])
-    pref["quiet_start"] = pref_row.get("quiet_start") or pref["quiet_start"]
-    pref["quiet_end"] = pref_row.get("quiet_end") or pref["quiet_end"]
-    pref["goals"] = _safe_goals_merge(pref_row.get("goals") or {})
-else:
-    # fallback: get basic goals from profiles.goals
-    pref["goals"] = _safe_goals_merge(read_profile_goals_text(uid))
-
-# -------------------- UI --------------------
 st.title("Nudge Preferences")
 
-st.caption("Answer in everyday units. We’ll store the right format for the nudge engine.")
-
-# --- Channel / cadence / tone ---
+# ================= Sections =================
 c1, c2, c3 = st.columns(3)
+
+# Channel
 nudge_channel = c1.selectbox(
-    "Where should we nudge you?",
+    "Channel",
     ["telegram", "inapp"],
-    index=["telegram", "inapp"].index(pref.get("nudge_channel", "telegram")),
-    help="Telegram is great for timely nudges. In-app shows hints when you open the dashboard."
+    index=(["telegram", "inapp"].index(pref_row.get("nudge_channel", "telegram"))
+           if pref_row.get("nudge_channel") in ["telegram", "inapp"] else 0)
 )
+
+# Cadence
 nudge_cadence = c2.selectbox(
-    "How often?",
+    "Cadence",
     ["smart", "hourly", "3_per_day"],
-    index=["smart", "hourly", "3_per_day"].index(pref.get("nudge_cadence", "smart")),
-    help="Smart tries to nudge only when it matters (gaps, time-of-day)."
+    index=(["smart", "hourly", "3_per_day"].index(pref_row.get("nudge_cadence", "smart"))
+           if pref_row.get("nudge_cadence") in ["smart", "hourly", "3_per_day"] else 0)
 )
+
+# Tone
 nudge_tone = c3.selectbox(
     "Tone",
-    ["gentle", "coachy", "fun"],
-    index=["gentle", "coachy", "fun"].index(pref.get("nudge_tone", "gentle"))
+    ["gentle", "coach", "strict"],
+    index=(["gentle", "coach", "strict"].index(pref_row.get("nudge_tone", "gentle"))
+           if pref_row.get("nudge_tone") in ["gentle", "coach", "strict"] else 0)
 )
-
-# --- Quiet hours ---
-st.subheader("Quiet hours")
-q1, q2 = st.columns(2)
-qs = q1.time_input("Start", value=None, step=300, help="Defaults to 22:00 if blank.")
-qe = q2.time_input("End", value=None, step=300, help="Defaults to 07:00 if blank.")
-st.caption("We won’t nudge you during quiet hours (sleep/focus time).")
 
 st.divider()
 
-# --- Goals (interactive & practical units) ---
-st.subheader("Daily Goals")
+# Timezone & Quiet hours
+st.subheader("Timing & Quiet Hours")
+tz_options = [
+    "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles",
+    "Europe/London", "Europe/Berlin", "Asia/Kolkata", "Asia/Singapore", "Australia/Sydney"
+]
+tz_val = pref_row.get("tz") or "America/New_York"
+tz = st.selectbox("Profile timezone", tz_options, index=tz_options.index(tz_val) if tz_val in tz_options else 0)
 
-# Activity / Hydration / Sleep
-gA, gB, gC = st.columns(3)
-steps_goal = gA.slider("Steps", 1000, 20000, int(pref["goals"]["steps"]), step=500,
-                       help="A practical daily movement target.")
-water_goal_l = gB.slider(
-    "Water (litres)",
-    0.5, 5.0,
-    round(pref["goals"]["water_ml"] / 1000, 1),
-    step=0.1,
-    help="We’ll convert to ml internally."
+qc1, qc2 = st.columns(2)
+quiet_start = _str_to_time(pref_row.get("quiet_start"), "22:00")
+quiet_end   = _str_to_time(pref_row.get("quiet_end"), "07:00")
+qs = qc1.time_input("Quiet hours start", value=quiet_start, step=300)
+qe = qc2.time_input("Quiet hours end",   value=quiet_end,   step=300)
+st.caption("During quiet hours, nudges are suppressed.")
+
+st.divider()
+
+# Goals
+st.subheader("Goals")
+gc1, gc2, gc3 = st.columns(3)
+
+steps_goal = gc1.number_input(
+    "Daily steps",
+    min_value=1000, max_value=30000, step=500,
+    value=int(pref_row.get("daily_step_goal") or (pref_row.get("goals", {}) or {}).get("steps") or 8000)
 )
-# quick tip: show equivalent glasses (≈250 ml per glass)
-approx_glasses = int(round((water_goal_l * 1000) / 250))
-gB.caption(f"≈ {approx_glasses} glasses (250 ml each)")
 
-sleep_goal_h = gC.slider(
+water_goal_l = gc2.number_input(
+    "Daily water (liters)",
+    min_value=0.5, max_value=6.0, step=0.25,
+    value=float((pref_row.get("daily_water_ml") or (pref_row.get("goals", {}) or {}).get("water_ml") or 2000)/1000.0)
+)
+
+sleep_goal_h = gc3.number_input(
     "Sleep (hours)",
-    4.0, 12.0,
-    round(pref["goals"]["sleep_minutes"] / 60, 1),
-    step=0.5,
-    help="We’ll convert to minutes internally."
+    min_value=4.0, max_value=12.0, step=0.5,
+    value=float((pref_row.get("sleep_goal_min") or (pref_row.get("goals", {}) or {}).get("sleep_minutes") or 420)/60.0)
 )
 
-st.markdown("#### Diet")
-d1, d2, d3, d4 = st.columns(4)
-calorie_goal = d1.number_input("Calories (kcal)", min_value=1000, max_value=5000, value=int(pref["goals"]["calories"]))
-protein_goal = d2.number_input("Protein (g)", min_value=0, max_value=300, value=int(pref["goals"]["protein"]))
-sugar_limit = d3.number_input("Added sugar limit (g)", min_value=0, max_value=200, value=int(pref["goals"]["sugar"]))
-fiber_goal = d4.number_input("Fiber (g) — optional", min_value=0, max_value=100,
-                             value=int(pref["goals"].get("fiber", 0)))
-st.caption("Tip: Balance your plate — prioritise protein and fiber, limit added sugar.")
-
-st.markdown("#### Mental health")
-m1, m2, m3 = st.columns(3)
-journaling = m1.selectbox(
-    "Journaling frequency",
-    ["None", "Daily", "3x/week", "Weekly"],
-    index=["None", "Daily", "3x/week", "Weekly"].index(pref["goals"].get("journaling", "None"))
+gc4, gc5, gc6 = st.columns(3)
+calorie_goal = gc4.number_input(
+    "Calories (kcal)",
+    min_value=1000, max_value=5000, step=50,
+    value=int(pref_row.get("daily_calorie_goal") or (pref_row.get("goals", {}) or {}).get("calories") or 2000)
 )
-meditation_min = m2.slider("Meditation (min/day)", 0, 120, int(pref["goals"]["meditation"]), 5)
-mood_target = m3.slider("Target average mood (1–5)", 1.0, 5.0, float(pref["goals"].get("mood_target", 3.5)), 0.1)
+
+protein_goal = gc5.number_input(
+    "Protein (g)",
+    min_value=20, max_value=300, step=5,
+    value=int(pref_row.get("protein_target_g") or (pref_row.get("goals", {}) or {}).get("protein") or 80)
+)
+
+sugar_limit = gc6.number_input(
+    "Added sugar (g) — soft target",
+    min_value=0, max_value=150, step=5,
+    value=int((pref_row.get("goals", {}) or {}).get("sugar") or 50)
+)
 
 st.divider()
 
-# --- Optional smart reminders (stored alongside goals; used later by your rules engine) ---
-with st.expander("Optional smart reminders"):
-    r1, r2, r3 = st.columns(3)
-    remind_hydration = r1.checkbox("Hydration: ping if <50% by 5pm",
-                                   value=bool(pref.get("remind_hydration", True)))
-    remind_steps = r2.checkbox("Steps: ping if <60% by 7pm",
-                               value=bool(pref.get("remind_steps", True)))
-    remind_sleep = r3.checkbox("Sleep: bedtime nudge 60 min before target",
-                               value=bool(pref.get("remind_sleep", False)))
+# Calendar suppression
+st.subheader("Calendar suppression")
+ics_url = st.text_input(
+    "Calendar ICS URL (optional)",
+    value=(pref_row or {}).get("calendar_ics_url") or "",  # <= coalesce None to ""
+    help="Paste a private ICS link from Google/Outlook/iCloud to silence nudges during events."
+)
 
-# -------------------- Save --------------------
-if st.button("Save", type="primary"):
-    quiet_start = qs.strftime("%H:%M") if qs else (pref.get("quiet_start") or "22:00")
-    quiet_end   = qe.strftime("%H:%M") if qe else (pref.get("quiet_end") or "07:00")
 
-    goals_json = {
-        # required by current nudge engine
+# Telegram (display only / optional override)
+st.subheader("Telegram")
+tg_display = (pref_row.get("telegram_chat_id") or "") or ""
+tg_col1, tg_col2 = st.columns([3,1])
+tg_col1.text_input("Linked Telegram chat id", value=str(tg_display), disabled=True)
+with tg_col2:
+    st.caption("Use /link in the bot to connect or re-link.")
+
+st.divider()
+
+# ================= Save =================
+save = st.button("Save preferences", type="primary")
+if save:
+    # convert liters/hours back to ml/min
+    water_ml = int(round(float(water_goal_l) * 1000))
+    sleep_min = int(round(float(sleep_goal_h) * 60))
+
+    # goals payload (kept for future expansion)
+    goals_payload = {
         "steps": int(steps_goal),
-        "water_ml": int(water_goal_l * 1000),
-        "sleep_minutes": int(round(sleep_goal_h * 60)),
-        # diet
+        "water_ml": water_ml,
+        "sleep_minutes": sleep_min,
         "calories": int(calorie_goal),
         "protein": int(protein_goal),
         "sugar": int(sugar_limit),
-        "fiber": int(fiber_goal),
-        # mental health
-        "journaling": journaling,
-        "meditation": int(meditation_min),
-        "mood_target": round(float(mood_target), 1),
     }
-
     payload = {
         "uid": uid,
+        "tz": tz,
         "nudge_channel": nudge_channel,
         "nudge_cadence": nudge_cadence,
         "nudge_tone": nudge_tone,
-        "quiet_start": quiet_start,
-        "quiet_end": quiet_end,
-        "goals": goals_json,
-        "remind_hydration": bool(remind_hydration),
-        "remind_steps": bool(remind_steps),
-        "remind_sleep": bool(remind_sleep),
+        "quiet_start": _time_to_str(qs),
+        "quiet_end": _time_to_str(qe),
+        "goals": goals_payload,
+        "daily_step_goal": goals_payload["steps"],
+        "daily_water_ml": goals_payload["water_ml"],
+        "sleep_goal_min": goals_payload["sleep_minutes"],
+        "daily_calorie_goal": goals_payload["calories"],
+        "protein_target_g": goals_payload["protein"],
+        "calendar_ics_url": (ics_url or "").strip() or None,
     }
-
     try:
-        # if row exists → update; else insert
-        existing = sb.table("hw_preferences").select("uid").eq("uid", uid).maybe_single().execute()
-        if getattr(existing, "data", None):
-            sb.table("hw_preferences").update(payload).eq("uid", uid).execute()
-        else:
-            sb.table("hw_preferences").insert(payload).execute()
-        st.success("Preferences saved! Nudges will use these updated goals and settings.")
+        exec_with_retry(sb.table("hw_preferences").upsert(payload, on_conflict="uid"))
+        st.success("Preferences saved! Nudges will respect quiet hours and your calendar.")
     except Exception as e:
-        # Fallback: save minimal goals to profiles.goals (text)
-        text = f"steps_goal:{goals_json['steps']}; water_goal:{goals_json['water_ml']}; sleep_goal:{goals_json['sleep_minutes']}; calories_goal:{goals_json['calories']}"
-        try:
-            sb.table("profiles").upsert({"id": uid, "goals": text}).execute()
-            st.info("Saved basic goals in profiles.goals. For full preferences, create the hw_preferences table.")
-        except Exception as e2:
-            st.error(f"Could not save preferences: {e2}")
+        st.error(f"Failed to save preferences: {e}")
+
+# ================= Info panel =================
+with st.expander("What do these settings do?", expanded=False):
+    st.markdown("""
+- **Channel**: where you receive nudges (Telegram or in-app).
+- **Cadence**: `smart` adapts to your day; `hourly` or `3_per_day` are fixed.
+- **Tone**: choose the coaching vibe of your nudges.
+- **Quiet hours**: nudges are muted (e.g., 22:00–07:00).
+- **Calendar ICS**: if set, nudges are suppressed during events.
+- **Goals**: drive streaks, badges, and pacing (steps/water/sleep/calories).
+    """)
